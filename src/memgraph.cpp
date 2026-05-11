@@ -1079,7 +1079,12 @@ int main(int argc, char **argv) {
   // CPython's TSS teardown, causing "gilstate_tss_set: failed to set current
   // tstate" fatal errors (bpo-42969). Since the process is about to exit, the
   // OS reclaims all resources. This is standard practice for embedded Python.
-  PyMem_RawFree(program_name);
+  //
+  // `PyMem_RawFree(program_name)` is intentionally omitted here: it only
+  // entered the stable ABI in Python 3.13 and our floor is 3.10. The
+  // allocation lives until process exit either way, so we let the OS reclaim
+  // it instead of taking on the 3.13 ABI dependency.
+  (void)program_name;
 
   memgraph::utils::total_memory_tracker.LogPeakMemoryUsage();
   return 0;
