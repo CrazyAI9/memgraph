@@ -97,7 +97,7 @@ class Memgraph(ConanFile):
         self.requires("gflags/2.2.0-memgraph", force=True)
         self.requires("jemalloc/5.2.1-memgraph")
         self.requires("libbcrypt/1.0-memgraph")
-        self.requires("librdkafka/2.6.1")
+        self.requires("librdkafka/2.6.1-memgraph")
         self.requires("librdtsc/0.3-memgraph")
         self.requires("mgclient/1.4.3")
         self.requires("nlohmann_json/3.11.3-memgraph")

@@ -1,0 +1,183 @@
+Memgraph-local fixes for four UBSan-reported undefined behavior sites in
+librdkafka 2.6.1. Each is independently verifiable; none are fixed in
+master as of this writing, so a version bump won't drop the patch.
+
+Per-hunk explanation:
+
+1. src/rdvarint.h -- left shift of negative int64 in zig-zag varint encoder.
+
+   `(num << 1)` on a negative int64_t is undefined per C11 6.5.7p4. UBSan
+   reports it as `runtime error: left shift of negative value`. This is
+   hit on every signed varint encode of a negative value; the Kafka v2
+   record format and consumer-group protocol use -1 sentinels for things
+   like leader epochs and offsets, so production traffic exercises it.
+   Casting to uint64_t before shifting moves the operation into well-
+   defined modular arithmetic; the bit pattern produced is unchanged on
+   every two's-complement target.
+   Annotation: none -- no new branch.
+   Upstream: https://github.com/confluentinc/librdkafka/issues/5395
+
+2. src/rdkafka.c -- initialize rk_ts_last_poll_start to rk_ts_created.
+
+   The fields `rk_ts_last_poll_start` and `rk_ts_last_poll_end` are
+   both left at 0 by struct creation. `rk_ts_last_poll_start` is then
+   only ever written inside the `if (rk_ts_last_poll_end)` block of
+   `rd_kafka_app_poll_start()` (rdkafka_int.h:1176).
+
+   But that block is skipped on the very first call of every consumer:
+   with `end` still 0, the body doesn't run, so `start` stays 0.
+   `rd_kafka_app_polled()` then sets `end` to a wall-clock timestamp,
+   not an interval. On the second call to `app_poll_start`, the block
+   finally runs:
+
+       idle_interval = end - start
+                     = ~1.7e15 us - 0 = ~1.7e15  (wall-clock, not interval)
+
+   `idle_interval * 1000000` then overflows int64_t. UBSan reports
+   `runtime error: signed integer overflow` deterministically on every
+   consumer's second poll, not after 107 days as the magnitudes might
+   suggest. Even with overflow suppressed, the ratio is meaningless on
+   that first sample: both intervals are wall-clock timestamps of
+   roughly equal size, so poll_idle_ratio ~= 1000000 (~"100% idle")
+   regardless of actual consumer behavior.
+
+   Fix at the source: initialize `rk_ts_last_poll_start` to
+   `rk->rk_ts_created` next to the existing `rk_ts_last_poll`
+   initialization. Subsequent computations work in intervals from rk
+   creation time, which are bounded by the consumer's actual lifetime
+   and never produce overflow under any realistic workload.
+
+   (In librdkafka master the same bug exists with the fields moved
+   onto rd_kafka_q_t; the upstream PR initializes
+   `rkq_ts_last_poll_start = rk->rk_ts_created` in
+   `rd_kafka_q_init0()`.)
+
+3. src/rdhdrhistogram.c -- clamp negative bucket index at source.
+
+   `rd_hdr_getBucketIndex()` can return a negative bucket index when v
+   is negative: the helper `bitLen(v | mask)` returns 0 for any
+   signed-negative input (its `x >= 0x8000` check is false), and the
+   computed bucket index `bitLen - unitMagnitude - subBucketHalfMag - 1`
+   is then strictly negative.
+
+   That negative bucketIdx then flows into four shift expressions in
+   the same file, each of which is UB per C11 6.5.7p3/p4:
+     - line 168 `(bucketIdx + 1) << subBucketHalfCountMagnitude`
+     - line 212 `v >> (idx + unitMagnitude)`
+     - line 219 `subBucketIdx << (bucketIdx + unitMagnitude)`
+     - line 229 `1 << (unitMagnitude + adjustedBucket)`
+   UBSan reports `runtime error: left shift of negative value` or
+   `shift exponent is negative` depending on which path executes
+   first.
+
+   Reachable in librdkafka via any rd_avg_add() call that passes a
+   negative value (e.g. a wrapped delta from signed-overflow upstream,
+   or a non-monotonic clock subtraction).
+
+   Fix at the source: clamp the bucket index to >= 0 in
+   `rd_hdr_getBucketIndex()` itself. All four downstream shift
+   expressions are then guaranteed non-negative shifts. Semantically
+   matches "values below lowest discernible value belong in bucket 0".
+   Verified with a 9-line UBSan reproducer; see the corresponding
+   upstream commit on the fork branch for details.
+
+4. src/rdkafka_metadata.c -- preserve err code on terminating path.
+
+   `rd_kafka_parse_Metadata0()` documents that it "returns an error
+   code on parse failure, else NO_ERROR" (docstring on the public
+   wrapper). One path violates that contract: when the broker is
+   terminating, line 514-516 sets `err = RD_KAFKA_RESP_ERR__DESTROY`
+   and `goto done`. The `done:` label at line 1060 unconditionally
+   returns RD_KAFKA_RESP_ERR_NO_ERROR, discarding the error code that
+   was just set.
+
+   The caller `rd_kafka_handle_Metadata()` then sees NO_ERROR, skips
+   its `if (err) goto err;` check, and dereferences `&mdi->metadata`
+   in the success branch. But `mdi` is NULL on this path (parse exits
+   before `rd_tmpabuf_alloc` runs). `&NULL->metadata` is UB per
+   C11 6.5.2.3; UBSan reports `member access within null pointer of
+   type rd_kafka_metadata_internal_t`. In practice on every
+   two's-complement target `&NULL->metadata` evaluates to NULL
+   numerically (metadata is the first field), so the runtime impact
+   is benign and production builds without UBSan won't notice it --
+   the defect is formal UB rather than a crashing bug.
+
+   The race is reachable in production, not only with the mock cluster.
+   `rd_kafka_terminating()` is a lock-free atomic read; it can flip
+   false->true between handle_Metadata's outer early-exit check and
+   parse_Metadata0's inner check, so any application that calls
+   `rd_kafka_destroy()` while a Metadata response is in flight can
+   race into this state. Mock-cluster tests catch it deterministically
+   because the in-process broker thread shortens the window
+   dramatically; on real brokers the network round-trip widens it.
+
+   Fix at the source: return `err` from `done:` instead of an
+   unconditional NO_ERROR. On the success path `err` is still
+   `RD_KAFKA_RESP_ERR_NO_ERROR` (initialized at line 490 and never
+   reassigned in the success flow), so the return value is unchanged.
+   On the terminating path `err` correctly propagates as `__DESTROY`,
+   which engages the caller's existing `if (err) goto err;` branch --
+   that branch already sets `md=NULL, mdi=NULL, rko_err=err` and
+   replies to the requester, so no caller-side change is needed.
+
+   The alternative of changing the terminating exit to `goto err`
+   instead would require also initializing `tbuf` at declaration:
+   `tbuf` is a local stack variable (rdkafka_metadata.c:473) without
+   an initializer, and `rd_tmpabuf_new(&tbuf, ...)` only runs at
+   line 535. The `err:` label unconditionally calls
+   `rd_tmpabuf_destroy(&tbuf)` at line 1085, so routing the early
+   terminating exit through `err:` would destroy an uninitialized
+   struct. Every existing `goto err` site (lines 546, 800) is after
+   `rd_tmpabuf_new`, which is why they're safe. Fixing `done:`
+   instead is a one-line change with no such prerequisite.
+   Annotation: none -- no new branch.
+
+--- a/src/rdvarint.h
++++ b/src/rdvarint.h
+@@ -68,7 +68,8 @@
+ static RD_INLINE RD_UNUSED size_t rd_uvarint_enc_i64(char *dst,
+                                                      size_t dstsize,
+                                                      int64_t num) {
+-        return rd_uvarint_enc_u64(dst, dstsize, (num << 1) ^ (num >> 63));
++        return rd_uvarint_enc_u64(dst, dstsize,
++                                  ((uint64_t)num << 1) ^ (uint64_t)(num >> 63));
+ }
+
+
+--- a/src/rdkafka.c
++++ b/src/rdkafka.c
+@@ -2289,6 +2289,7 @@
+         cnd_init(&rk->rk_telemetry.termination_cnd);
+
+         rd_atomic64_init(&rk->rk_ts_last_poll, rk->rk_ts_created);
++        rk->rk_ts_last_poll_start = rk->rk_ts_created;
+         rd_atomic32_init(&rk->rk_flushing, 0);
+
+         rk->rk_rep             = rd_kafka_q_new(rk);
+--- a/src/rdhdrhistogram.c
++++ b/src/rdhdrhistogram.c
+@@ -202,8 +202,11 @@
+ static RD_INLINE int32_t rd_hdr_getBucketIndex(const rd_hdr_histogram_t *hdr,
+                                                int64_t v) {
+         int64_t pow2Ceiling = bitLen(v | hdr->subBucketMask);
+-        return (int32_t)(pow2Ceiling - (int64_t)hdr->unitMagnitude -
+-                         (int64_t)(hdr->subBucketHalfCountMagnitude + 1));
++        int64_t result      = pow2Ceiling - (int64_t)hdr->unitMagnitude -
++                         (int64_t)(hdr->subBucketHalfCountMagnitude + 1);
++        if (unlikely(result < 0))
++                result = 0;
++        return (int32_t)result;
+ }
+
+ static RD_INLINE int32_t rd_hdr_getSubBucketIdx(const rd_hdr_histogram_t *hdr,
+--- a/src/rdkafka_metadata.c
++++ b/src/rdkafka_metadata.c
+@@ -1057,7 +1057,7 @@
+          * to the caller. */
+         *mdip = mdi;
+
+-        return RD_KAFKA_RESP_ERR_NO_ERROR;
++        return err;
+
+ err_parse:
+         err = rkbuf->rkbuf_err;

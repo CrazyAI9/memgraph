@@ -1,0 +1,15 @@
+sources:
+  "2.6.1-memgraph":
+    url: "https://github.com/edenhill/librdkafka/archive/v2.6.1.tar.gz"
+    sha256: "0ddf205ad8d36af0bc72a2fec20639ea02e1d583e353163bf7f4683d949e901b"
+patches:
+  "2.6.1-memgraph":
+    - patch_file: "patches/0001-Change-library-names-1-9-1.patch"
+      patch_description: "find_package conan packages"
+      patch_type: "conan"
+    - patch_file: "patches/0002-Change-library-targets-and-result-variables-2-5-0.patch"
+      patch_description: "refer conan package names"
+      patch_type: "conan"
+    - patch_file: "patches/0003-memgraph-librdkafka-ub-fixes.patch"
+      patch_description: "Memgraph-local UB fixes: zig-zag varint, poll-idle telemetry, HDR histogram shift, metadata terminating-path err propagation"
+      patch_type: "portability"
