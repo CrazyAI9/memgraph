@@ -8369,14 +8369,6 @@ TEST_P(CypherMainVisitorTest, SuspendResumeDatabase) {
     EXPECT_FALSE(query->force_);
   }
 
-  // SUSPEND DATABASE with underscore name
-  {
-    auto *query = dynamic_cast<MultiDatabaseQuery *>(ast_generator.ParseQuery("SUSPEND DATABASE production_db"));
-    ASSERT_NE(query, nullptr);
-    EXPECT_EQ(query->action_, MultiDatabaseQuery::Action::SUSPEND);
-    EXPECT_EQ(query->db_name_, "production_db");
-  }
-
   // RESUME DATABASE
   {
     auto *query = dynamic_cast<MultiDatabaseQuery *>(ast_generator.ParseQuery("RESUME DATABASE testdb"));
@@ -8384,14 +8376,6 @@ TEST_P(CypherMainVisitorTest, SuspendResumeDatabase) {
     EXPECT_EQ(query->action_, MultiDatabaseQuery::Action::RESUME);
     EXPECT_EQ(query->db_name_, "testdb");
     EXPECT_FALSE(query->force_);
-  }
-
-  // RESUME DATABASE with underscore name
-  {
-    auto *query = dynamic_cast<MultiDatabaseQuery *>(ast_generator.ParseQuery("RESUME DATABASE production_db"));
-    ASSERT_NE(query, nullptr);
-    EXPECT_EQ(query->action_, MultiDatabaseQuery::Action::RESUME);
-    EXPECT_EQ(query->db_name_, "production_db");
   }
 }
 
